@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 830 400" font-family="DejaVu Sans, Arial, sans-serif">
+  <rect width="830" height="400" fill="#16161b"/>
+  <text x="415" y="28" fill="#e6e6ea" font-size="16" text-anchor="middle">Per-monitor workspaces (logical layout, from monitors-archfixe.lua)</text>
+  <!-- DP-1 ultrawide: 2752x1152 logical at (767,347); scale 0.2 -->
+  <g>
+    <rect x="113" y="50" width="550" height="230" rx="6" fill="#23232b" stroke="#7aa2f7" stroke-width="2"/>
+    <text x="388" y="110" fill="#7aa2f7" font-size="18" text-anchor="middle">DP-1 · 34" ultrawide 3440×1440 @100 Hz</text>
+    <text x="388" y="140" fill="#c0c0c8" font-size="14" text-anchor="middle">workspaces 1 – 10 (default 1)</text>
+    <g fill="#7aa2f7" font-size="12" text-anchor="middle">
+      <rect x="168" y="170" width="40" height="26" rx="4" fill="#3b4a70"/><text x="188" y="188" fill="#e6e6ea">1</text>
+      <rect x="213" y="170" width="40" height="26" rx="4" fill="#2c2c36"/><text x="233" y="188" fill="#c0c0c8">2</text>
+      <rect x="258" y="170" width="40" height="26" rx="4" fill="#2c2c36"/><text x="278" y="188" fill="#c0c0c8">3</text>
+      <text x="350" y="188" fill="#c0c0c8">…</text>
+      <rect x="560" y="170" width="40" height="26" rx="4" fill="#2c2c36"/><text x="580" y="188" fill="#c0c0c8">10</text>
+    </g>
+    <text x="388" y="240" fill="#8a8a96" font-size="12" text-anchor="middle">scale 1.25</text>
+  </g>
+  <!-- DP-3 AOC: 1920x1080 logical at (358,1499) -->
+  <g>
+    <rect x="31" y="280" width="384" height="110" rx="6" fill="#23232b" stroke="#e0af68" stroke-width="2"/>
+    <text x="223" y="312" fill="#e0af68" font-size="15" text-anchor="middle">DP-3 · AOC QD-OLED 2560×1440 @360 Hz</text>
+    <text x="223" y="336" fill="#c0c0c8" font-size="13" text-anchor="middle">workspaces 21 – 30 · main monitor</text>
+    <text x="223" y="360" fill="#8a8a96" font-size="12" text-anchor="middle">fringe shader · OLED screensaver</text>
+  </g>
+  <!-- DP-2 Samsung: 1920x1080 logical at (2279,1499) -->
+  <g>
+    <rect x="415" y="280" width="384" height="110" rx="6" fill="#23232b" stroke="#9ece6a" stroke-width="2"/>
+    <text x="607" y="312" fill="#9ece6a" font-size="15" text-anchor="middle">DP-2 · Samsung 1920×1080 @144 Hz</text>
+    <text x="607" y="336" fill="#c0c0c8" font-size="13" text-anchor="middle">workspaces 11 – 20</text>
+    <text x="607" y="360" fill="#8a8a96" font-size="12" text-anchor="middle">Super+1…0 acts on the monitor under the mouse</text>
+  </g>
+</svg>
