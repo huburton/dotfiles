@@ -1,0 +1,14 @@
+[Unit]
+Description=Mises à jour automatiques en fond (voir /usr/local/sbin/maj-auto)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/maj-auto fond
+Nice=15
+IOSchedulingClass=idle
+# À l'extinction, seul le script reçoit SIGTERM : il coupe un téléchargement,
+# mais laisse toujours une installation pacman se terminer.
+KillMode=mixed
+TimeoutStopSec=30min

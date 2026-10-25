@@ -1,0 +1,21 @@
+#!/bin/bash
+# Cache du lanceur d'applis les .desktop listés dans ~/.config/hidden-apps.list :
+# copie de l'entrée du paquet avec NoDisplay=true dans ~/.local/share/applications
+# (régénérée à chaque passage pour suivre les mises à jour des paquets).
+# NoDisplay (et pas Hidden) : l'appli reste lançable (terminal, raccourcis, gtk-launch).
+set -u
+list="${LIST:-$HOME/.config/hidden-apps.list}"
+dst="${DST:-$HOME/.local/share/applications}"
+tag="X-Generated-By=hide-apps"
+mkdir -p "$dst"
+grep -lZx "$tag" "$dst"/*.desktop 2>/dev/null | xargs -0 -r rm -f --
+grep -vE '^[[:space:]]*(#|$)' "$list" | while read -r id; do
+  [ -e "$dst/$id" ] && continue          # override fait à la main : on n'y touche pas
+  for d in /usr/local/share /usr/share /var/lib/flatpak/exports/share; do
+    src="$d/applications/$id"; [ -f "$src" ] || continue
+    # sans MimeType : une appli cachée ne devient jamais l'appli par défaut par accident
+    sed -e '/^NoDisplay=/d' -e '/^MimeType=/d' -e "0,/^\[Desktop Entry\]/s//[Desktop Entry]\nNoDisplay=true\n$tag/" "$src" > "$dst/$id"
+    break
+  done
+done
+update-desktop-database "$dst" 2>/dev/null || true

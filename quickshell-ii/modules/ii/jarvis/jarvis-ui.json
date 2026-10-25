@@ -1,0 +1,14 @@
+{
+  "style": "orb",
+  "palette": "blue",
+  "confirmPalette": "gold",
+  "size": 220,
+  "quality": 1,
+  "intensity": 1.0,
+  "glowScale": 1.0,
+  "lineWidth": 1.0,
+  "ringBrightness": 1.0,
+  "pointScale": 1.0,
+  "backdrop": 0.8,
+  "fps": 60
+}

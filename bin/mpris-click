@@ -1,0 +1,39 @@
+#!/bin/bash
+# 1 clic = play/pause  2 clics = next  3 clics = previous
+# Détecte les clics rapides via fichier timestamp
+
+STATEFILE="/tmp/mpris-clicks"
+NOW=$(date +%s%3N)  # ms
+
+# Lire état précédent
+LAST_TIME=0
+COUNT=0
+[ -f "$STATEFILE" ] && read LAST_TIME COUNT < "$STATEFILE"
+
+DIFF=$(( NOW - LAST_TIME ))
+
+if [ "$DIFF" -lt 400 ]; then
+    COUNT=$(( COUNT + 1 ))
+else
+    COUNT=1
+fi
+
+echo "$NOW $COUNT" > "$STATEFILE"
+
+# Attendre 400ms pour voir si d'autres clics arrivent
+sleep 0.4
+
+# Relire — si le count a changé pendant l'attente, c'est un autre process qui gère
+read FINAL_TIME FINAL_COUNT < "$STATEFILE" 2>/dev/null
+[ "$FINAL_COUNT" -ne "$COUNT" ] && exit 0
+
+# Exécuter l'action
+case "$COUNT" in
+    1) playerctl play-pause ;;
+    2) playerctl next ;;
+    3) playerctl previous ;;
+    *) playerctl play-pause ;;
+esac
+
+# Reset
+rm -f "$STATEFILE"

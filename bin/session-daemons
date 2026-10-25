@@ -1,0 +1,59 @@
+#!/bin/bash
+# Démons de la session Hyprland, supervisés : relancés automatiquement s'ils
+# s'arrêtent. Avant, un crash de qs coupait la barre, les notifications et
+# l'écran de verrouillage jusqu'au prochain login ; un crash d'hypridle coupait
+# l'économiseur OLED.
+# Lancé par /usr/local/bin/hyprland-conf-session (ou à la main via Hyprland :
+#   hyprctl dispatch 'hl.dsp.exec_cmd("~/.local/bin/session-daemons")'),
+# une seule fois par session (verrou flock).
+#
+# Redémarrer le shell : `pkill -x qs` (Ctrl+Super+R) — il revient tout seul.
+# Si qs meurt pendant que l'écran est verrouillé ($XDG_RUNTIME_DIR/ii-locked,
+# écrit par LockScreen.qml), le nouveau qs reverrouille aussitôt.
+
+LOGDIR="$HOME/.local/state/hypr-session"
+mkdir -p "$LOGDIR"
+exec 9>"$XDG_RUNTIME_DIR/session-daemons.lock"
+flock -n 9 || { echo "session-daemons déjà lancé" >&2; exit 0; }
+
+# Écran principal = l'OLED (focus au démarrage, « primary » X11), une fois par session.
+"$HOME/.local/bin/ecran-principal" 9>&- >>"$LOGDIR/autostart.log" 2>&1 &
+
+# Les journaux sont sur le home NFS et grossissaient sans fin : on garde la fin.
+for f in "$LOGDIR"/*.log; do
+    [ "$(stat -c %s "$f" 2>/dev/null || echo 0)" -gt 2000000 ] || continue
+    tail -n 5000 "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+done
+
+keepalive() { # keepalive <log> <commande…>
+    local log=$1; shift
+    (
+        exec 9>&-
+        while true; do
+            t0=$(date +%s)
+            "$@" >>"$LOGDIR/$log" 2>&1
+            rc=$? dt=$(( $(date +%s) - t0 ))
+            # Sortie immédiate = autre instance déjà là (qs -n) : on réessaie sans bruit.
+            [ $dt -ge 5 ] && echo "[session-daemons] $(date -Iseconds) $1 arrêté (code $rc après ${dt}s), relance" >>"$LOGDIR/autostart.log"
+            [ $dt -lt 30 ] && sleep 10 || sleep 1
+        done
+    ) &
+}
+
+run_qs() {
+    if [ -e "$XDG_RUNTIME_DIR/ii-locked" ]; then
+        ( for _ in $(seq 1 20); do
+              sleep 1
+              qs -c ii ipc call lock activate >/dev/null 2>&1 && break
+          done ) &
+    fi
+    qs -n -c ii
+}
+
+keepalive quickshell.log run_qs
+keepalive hypridle.log hypridle
+keepalive pypr.log pypr
+keepalive cliphist.log wl-paste --type text --watch cliphist store
+keepalive cliphist.log wl-paste --type image --watch cliphist store
+
+wait

@@ -1,0 +1,110 @@
+#!/bin/bash
+# Mode IA : met en pause le fond animé (mpvpaper ≈ 1,5 Go de VRAM par écran) pour laisser
+# la RTX 5080 au modèle local (llama-router), puis le relance à l'identique.
+# L'économiseur OLED (oled-screensaver) en tient compte : en mode IA il ne couvre que l'OLED.
+# Usage : ai-mode on|off|toggle|status
+# Depuis le 13/10/2026 le fond animé est le service wallpaper-video (un seul mpvpaper) :
+# « on » le met en pause (image fixe, sans GPU), « off » le relance une fois la VRAM rendue.
+FLAG="${XDG_RUNTIME_DIR:-/tmp}/ai-mode"
+RESTORE="$HOME/.config/hypr/custom/scripts/__restore_video_wallpaper.sh"
+# Appelé aussi par pc-status (service systemd, PATH sans ~/.local/bin) : sans ça, « command -v wallpaper-video »
+# échouait, le service restait en pause et 3 mpvpaper à l'ancienne s'empilaient sur swaybg (kitty clignotait, 14/10).
+export PATH="$HOME/.local/bin:$PATH"
+
+wallpaper_pids() { pgrep -f '^mpvpaper -o '; } # fond seulement (l'économiseur utilise -l overlay)
+
+unload_models() {
+    # Libère la VRAM avant de relancer le fond animé (sinon mpvpaper n'a plus de place).
+    local key; key=$(cat "$HOME/.config/llm/api-key" 2>/dev/null) || return
+    curl -s -m 3 -H "Authorization: Bearer $key" localhost:8080/models 2>/dev/null |
+        jq -r '.data[] | select(.status.value != "unloaded") | .id' 2>/dev/null |
+        while read -r model; do
+            curl -s -m 15 -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+                -d "{\"model\": \"$model\"}" localhost:8080/models/unload >/dev/null
+        done
+}
+
+wait_for_vram() {
+    # Le modèle déchargé libère sa VRAM en quelques secondes ; sans ça mpv ne trouve pas de décodeur
+    # matériel et décode la vidéo 4K au processeur (≈ 90 % d'un cœur par écran).
+    local free
+    for _ in $(seq 20); do
+        free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1)
+        [ "${free:-0}" -ge 5000 ] && return
+        sleep 1
+    done
+}
+
+gpu_pids() { nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null; }
+
+restart_wallpaper() {
+    [ -n "$(wallpaper_pids)" ] && return
+    [ -f "$RESTORE" ] || return
+    wait_for_vram
+    # Même options et même vidéo que le script de restauration de ii, mais sans son
+    # « pkill mpvpaper » qui tuerait aussi un économiseur en cours.
+    local opts video
+    opts=$(grep -o 'mpvpaper -o "[^"]*"' "$RESTORE" | head -1 | sed 's/^mpvpaper -o "//; s/"$//')
+    video=$(grep -o '"/[^"]*"' "$RESTORE" | tail -1 | tr -d '"')
+    [ -f "$video" ] || return
+    local monitor pid
+    declare -A started
+    for monitor in $(hyprctl monitors -j | jq -r '.[].name'); do
+        setsid mpvpaper -o "$opts" "$monitor" "$video" >/dev/null 2>&1 9>&- &
+        started[$monitor]=$!
+        sleep 0.1
+    done
+    # Contrôle : un mpvpaper absent de la liste des processus GPU décode au CPU → on le relance une fois
+    sleep 4
+    for monitor in "${!started[@]}"; do
+        pid=${started[$monitor]}
+        if ! gpu_pids | grep -qx "$pid"; then
+            kill "$pid" 2>/dev/null
+            sleep 1
+            setsid mpvpaper -o "$opts" "$monitor" "$video" >/dev/null 2>&1 9>&- &
+        fi
+    done
+}
+
+# Une seule bascule à la fois : un « on » lancé pendant un « off » (≈ 15 s : déchargement, VRAM, relance)
+# laissait le drapeau à « actif » avec le fond animé relancé, et l'état paraissait inversé.
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/ai-mode.lock"
+flock 9
+
+action="$1"
+[ "$action" = toggle ] && { [ -e "$FLAG" ] && action=off || action=on; }
+
+case "$action" in
+    on)
+        # Idempotent sur la réalité : même si le drapeau existe déjà, aucun fond animé ne doit tourner
+        was_on=$([ -e "$FLAG" ] && echo 1)
+        touch "$FLAG"
+        command -v wallpaper-video >/dev/null && wallpaper-video pause
+        wallpaper_pids | xargs -r kill -9
+        [ -z "$was_on" ] && notify-send -a "Mode IA" -i applications-science "Mode IA activé" "Fond animé en pause : la VRAM est libre pour le modèle local."
+        ;;
+    off)
+        if command -v wallpaper-video >/dev/null; then
+            rm -f "$FLAG"
+            unload_models
+            wallpaper-video resume  # le service attend lui-même assez de VRAM libre
+            notify-send -a "Mode IA" -i applications-science "Mode IA désactivé" "Fond animé relancé."
+            exit 0
+        fi
+        [ ! -e "$FLAG" ] && [ -n "$(wallpaper_pids)" ] && exit 0
+        rm -f "$FLAG"
+        if [ -z "$(wallpaper_pids)" ]; then
+            unload_models
+            sleep 1
+            restart_wallpaper
+        fi
+        notify-send -a "Mode IA" -i applications-science "Mode IA désactivé" "Fond animé relancé."
+        ;;
+    status)
+        [ -e "$FLAG" ] && echo on || echo off
+        ;;
+    *)
+        echo "Usage: $0 on|off|toggle|status" >&2
+        exit 1
+        ;;
+esac

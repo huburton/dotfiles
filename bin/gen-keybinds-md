@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Génère ~/Notes/Claude/keybinds.md depuis hyprctl binds, catégorisé."""
+import json, subprocess, re
+from pathlib import Path
+from datetime import datetime
+
+binds = json.loads(subprocess.check_output(["hyprctl", "binds", "-j"]))
+
+MODS = {
+    0: "", 1: "SHIFT", 4: "CTRL", 8: "ALT", 64: "SUPER",
+    65: "SUPER+SHIFT", 68: "SUPER+CTRL", 72: "SUPER+ALT",
+    5: "CTRL+SHIFT", 12: "CTRL+ALT", 9: "ALT+SHIFT",
+    13: "CTRL+ALT+SHIFT", 76: "SUPER+CTRL+ALT",
+    73: "SUPER+ALT+SHIFT", 69: "SUPER+CTRL+SHIFT",
+}
+KEYRENAME = {
+    "ampersand": "1 (&)", "eacute": "2 (é)", "quotedbl": "3 (\")",
+    "apostrophe": "4 (')", "parenleft": "5 (()", "section": "6 (§)",
+    "egrave": "7 (è)", "exclam": "8 (!)", "ccedilla": "9 (ç)", "agrave": "10 (à)",
+    "Slash": "/", "colon": ": (BE)", "Period": ".", "Comma": ",",
+    "Return": "↵ Enter", "BackSpace": "⌫ Backspace", "Escape": "⎋ Esc",
+    "Tab": "↹ Tab", "Space": "␣ Space", "grave": "` (grave)",
+    "bracketleft": "[", "bracketright": "]",
+}
+
+def key_name(k): return KEYRENAME.get(k, k)
+def mod_name(m): return MODS.get(m, f"mod{m}")
+
+def category(b):
+    desc = (b.get("description") or "").lower()
+    disp = b.get("dispatcher", "")
+    arg = (b.get("arg") or "").lower()
+    key = b.get("key", "")
+    if "cheatsheet" in arg or "cheatsheet" in desc: return "🔍 Aide / Cheatsheet"
+    if "quickshell:" in arg: return "✨ Quickshell / UI"
+    if disp in ("workspace", "movetoworkspace"): return "🖥 Workspaces"
+    if disp in ("killactive", "togglefloating", "fullscreen", "togglegroup", "pin", "swapactiveworkspaces"): return "🪟 Fenêtres"
+    if disp in ("movefocus", "swapwindow", "movewindow"): return "↔ Navigation fenêtres"
+    if disp == "resizeactive" or disp == "submap": return "📐 Redimensionnement"
+    if "pypr" in arg: return "💫 Scratchpads"
+    if "XF86" in key or "asusctl" in arg or "fn-notify" in arg or "kbd_backlight" in arg: return "⚡ ASUS / Fn keys"
+    if disp == "exec" and any(x in arg for x in ("zen-browser", "obsidian", "code", "kitty", "rog-control", "blueman", "thunar", "dolphin")): return "🚀 Applications"
+    if "hyprexpo" in arg: return "🌐 Overview"
+    if any(x in arg for x in ("playerctl", "wpctl", "brightnessctl", "pamixer")): return "🎵 Média / Son"
+    if "screenshot" in arg or "grim" in arg or "slurp" in arg or "satty" in arg: return "📷 Captures"
+    return "🔧 Autres"
+
+documented = [b for b in binds if b.get("description")]
+for b in binds:
+    if not b.get("description") and b.get("dispatcher") in ("workspace", "movetoworkspace", "killactive", "togglefloating", "fullscreen"):
+        b["description"] = f"_({b['dispatcher']}, {b.get('arg','')})_"
+        documented.append(b)
+
+groups = {}
+for b in documented:
+    groups.setdefault(category(b), []).append(b)
+
+order = ["🔍 Aide / Cheatsheet", "🚀 Applications", "💫 Scratchpads",
+         "🖥 Workspaces", "🪟 Fenêtres", "↔ Navigation fenêtres", "📐 Redimensionnement",
+         "🌐 Overview", "✨ Quickshell / UI", "🎵 Média / Son",
+         "⚡ ASUS / Fn keys", "📷 Captures", "🔧 Autres"]
+
+lines = [
+    "# Keybinds Hyprland — Référence complète",
+    "",
+    "> **Live** : `SUPER + :` (touche « : » sur AZERTY BE) ouvre le cheatsheet quickshell.",
+    "> **Regen** : lance `gen-keybinds-md` à chaque changement de config.",
+    "",
+    f"_Généré le {datetime.now().strftime('%Y-%m-%d %H:%M')} depuis `hyprctl binds`._ "
+    f"**{len(binds)}** bindings total, **{len(documented)}** documentés.",
+    "",
+    "---",
+    "",
+]
+
+for cat in order:
+    if cat not in groups: continue
+    items = sorted(groups[cat], key=lambda x: (x.get("modmask", 0), x.get("key", "")))
+    lines.append(f"## {cat}")
+    lines.append("")
+    lines.append("| Raccourci | Action |")
+    lines.append("|-----------|--------|")
+    for b in items:
+        combo = mod_name(b.get("modmask", 0))
+        key = key_name(b.get("key", ""))
+        combo_str = f"`{combo} + {key}`" if combo else f"`{key}`"
+        desc = (b.get("description") or "").replace("|", "\\|")
+        lines.append(f"| {combo_str} | {desc} |")
+    lines.append("")
+
+out = Path.home() / "Obsidian Vault" / "Claude" / "keybinds.md"
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text("\n".join(lines))
+print(f"✓ {out}")
+print(f"  {len(binds)} bindings · {len(documented)} documentés · {len(groups)} catégories")

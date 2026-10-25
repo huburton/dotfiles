@@ -1,0 +1,290 @@
+#!/bin/bash
+# maj-auto — mises à jour automatiques d'archfixe.
+#
+#   maj-auto fond        Lancé chaque heure par maj-auto.timer, mais ne fait une vraie passe
+#                        qu'une fois toutes les 20 h, jamais pendant un jeu. Installe tout
+#                        sauf le « groupe redémarrage », télécharge ce groupe, met à jour les
+#                        Flatpak, vérifie la signature Secure Boot et prévient (notifications).
+#   maj-auto extinction  Lancé à l'arrêt/redémarrage par maj-auto-extinction.service : installe
+#                        le groupe redémarrage (noyau, NVIDIA, Hyprland, Qt, Quickshell), puis
+#                        vérifie le module NVIDIA, l'UKI et sa signature.
+#   maj-auto news-lue    À lancer (sudo) après avoir traité une annonce Arch qui a mis les
+#                        mises à jour en pause.
+#   maj-auto maintenant  Même passe que « fond », sans attendre les 20 h (bouton « Mettre à
+#                        jour » d'ii, via pkexec) : le groupe redémarrage reste pour l'extinction.
+#
+# Les paquets AUR ne sont jamais mis à jour automatiquement (non vérifiés par Arch) : simple notif.
+# Journal : journalctl -u maj-auto -u maj-auto-extinction
+
+set -uo pipefail
+
+UTILISATEUR=huburton
+ETAT=/var/lib/maj-auto
+# Paquets qu'on ne remplace pas pendant que la session tourne : ils ne servent qu'après un
+# redémarrage, et les changer à chaud casse les applis lancées ensuite (pilote NVIDIA
+# userspace ≠ module chargé, Qt ≠ Quickshell en cours, hyprctl ≠ Hyprland en cours).
+GROUPE_REDEMARRAGE='linux,linux-headers,nvidia-open-dkms,nvidia-utils,lib32-nvidia-utils,hypr*-git,aquamarine-git,xdg-desktop-portal-hyprland-git,qt6-*,quickshell'
+HYPR_PAQUETS='^(hypr[^ ]*-git|aquamarine-git|xdg-desktop-portal-hyprland-git) '
+UKI=/boot/efi/EFI/Linux/arch-linux.efi
+FICHIERS_SIGNES=(/boot/efi/EFI/ArchFixe/grubx64.efi /boot/efi/EFI/tools/reboot_to_windows.efi /boot/vmlinuz-linux "$UKI")
+INTERVALLE=$((20 * 3600))
+INTERVALLE_APRES_ECHEC=$((6 * 3600))
+
+mkdir -p "$ETAT"
+log() { echo "[maj-auto] $*"; }
+
+notifier() { # notifier <low|normal|critical> <titre> <texte>
+    local uid
+    uid=$(id -u "$UTILISATEUR")
+    [ -S "/run/user/$uid/bus" ] || return 0
+    runuser -u "$UTILISATEUR" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        notify-send -a "Mises à jour" -u "$1" -i system-software-update "$2" "$3" 2>/dev/null || true
+}
+
+age() { # secondes depuis la dernière modification du fichier (très grand s'il n'existe pas)
+    [ -e "$1" ] && echo $(($(date +%s) - $(stat -c %Y "$1"))) || echo 999999999
+}
+
+jeu_en_cours() { pgrep -f -- 'SteamLaunch AppId=|gamescope|wine64-preloader|wine-preloader' >/dev/null; }
+arret_en_cours() { [ "$(systemctl is-system-running 2>/dev/null)" = stopping ]; }
+
+# Téléchargement interruptible : abandonné si un jeu démarre (pour ne pas faire laguer)
+# ou si l'extinction commence. Retourne 0 seulement si la commande a abouti.
+telecharger() {
+    "$@" &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if jeu_en_cours || arret_en_cours || [ -n "${ARRET:-}" ]; then
+            log "téléchargement interrompu (jeu lancé ou extinction)"
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            return 1
+        fi
+        sleep 5
+    done
+    wait "$pid"
+}
+
+# Installation : jamais interrompue (un pacman tué en pleine transaction casse le système).
+installer() {
+    "$@" &
+    local pid=$!
+    while ! wait "$pid"; do
+        kill -0 "$pid" 2>/dev/null || return 1 # vraie erreur (wait interrompu par un signal sinon)
+    done
+}
+
+news_bloquantes() {
+    # Annonces Arch « intervention manuelle » publiées depuis la dernière fois qu'on les a lues.
+    local depuis
+    depuis=$(stat -c %Y "$ETAT/news-lue" 2>/dev/null || date +%s)
+    curl -fs --max-time 20 https://archlinux.org/feeds/news/ | python3 -c '
+import sys, xml.etree.ElementTree as ET, email.utils as eu
+depuis = float(sys.argv[1])
+for it in ET.fromstring(sys.stdin.read()).iter("item"):
+    titre = it.findtext("title") or ""
+    texte = (titre + (it.findtext("description") or "")).lower()
+    if eu.parsedate_to_datetime(it.findtext("pubDate")).timestamp() > depuis and "intervention" in texte:
+        print(titre)' "$depuis" 2>/dev/null
+}
+
+verifier_secureboot() {
+    # Tout ce que shim → GRUB chargent doit rester signé, sinon Linux ne démarre plus.
+    local f sortie erreur=0
+    sortie=$(sbctl verify 2>&1)
+    for f in "${FICHIERS_SIGNES[@]}"; do
+        if [ ! -f "$f" ]; then
+            log "MANQUANT : $f"
+            erreur=1
+        elif ! grep -qF "$f is signed" <<<"$sortie"; then
+            log "non signé, je signe : $f"
+            sbctl sign "$f" || erreur=1
+        fi
+    done
+    return $erreur
+}
+
+uki_version() { # version du noyau embarqué dans l'UKI (section .uname)
+    local tmp
+    tmp=$(mktemp)
+    objcopy -O binary --only-section=.uname "$UKI" "$tmp" 2>/dev/null && cat "$tmp"
+    rm -f "$tmp"
+}
+
+verifier_noyau() {
+    # Le module NVIDIA doit exister pour le noyau installé, et l'UKI doit être à jour et signée.
+    local kver
+    kver=$(pacman -Ql linux | sed -n 's|^linux /usr/lib/modules/\([^/]*\)/vmlinuz$|\1|p')
+    if ! ls /usr/lib/modules/"$kver"/updates/dkms/nvidia.ko* >/dev/null 2>&1; then
+        log "module NVIDIA absent pour $kver, reconstruction DKMS"
+        dkms autoinstall -k "$kver"
+        ls /usr/lib/modules/"$kver"/updates/dkms/nvidia.ko* >/dev/null 2>&1 || return 1
+    fi
+    if [ "$(uki_version)" != "$kver" ]; then
+        log "UKI absente ou pas construite pour $kver, reconstruction"
+        mkinitcpio -P || return 1
+    fi
+    verifier_secureboot
+}
+
+fond() {
+    if [ -e "$ETAT/rapport-extinction" ]; then
+        notifier normal "Mises à jour installées à l'extinction" "$(cat "$ETAT/rapport-extinction")"
+        rm -f "$ETAT/rapport-extinction"
+    fi
+    arret_en_cours && exit 0
+    if [ -z "${MAINTENANT:-}" ]; then
+        [ "$(age "$ETAT/derniere-reussite")" -lt "$INTERVALLE" ] && exit 0
+        [ "$(age "$ETAT/dernier-echec")" -lt "$INTERVALLE_APRES_ECHEC" ] && exit 0
+    fi
+    jeu_en_cours && { log "jeu en cours, nouvel essai dans une heure"; exit 0; }
+    [ -e /var/lib/pacman/db.lck ] && { log "pacman déjà utilisé, nouvel essai dans une heure"; exit 0; }
+
+    local news
+    news=$(news_bloquantes)
+    if [ -n "$news" ]; then
+        log "en pause, annonce Arch à lire : $news"
+        notifier critical "Mises à jour en pause" "Annonce Arch à lire avant de continuer : $news. Demande à Claude, ou lance « sudo maj-auto news-lue » une fois traité."
+        exit 0
+    fi
+
+    trap 'ARRET=1' TERM
+    local python_avant echec=0
+    python_avant=$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null)
+
+    log "synchronisation et téléchargement"
+    if telecharger pacman -Syuw --noconfirm; then
+        log "installation (sauf groupe redémarrage)"
+        installer pacman -S --needed --noconfirm archlinux-keyring chaotic-keyring || echec=1
+        installer pacman -Su --noconfirm --ignore "$GROUPE_REDEMARRAGE" || echec=1
+    else
+        [ -n "${ARRET:-}" ] || jeu_en_cours || arret_en_cours || echec=1
+        [ $echec = 0 ] && exit 0 # simple report : jeu lancé ou extinction
+    fi
+
+    local restant
+    restant=$(en_attente | grep -c .)
+    if [ "$restant" -gt 0 ] && [ $echec = 0 ]; then
+        touch "$ETAT/a-installer-extinction"
+        notifier normal "Mises à jour prêtes pour l'extinction" "$restant paquets (noyau, NVIDIA, Hyprland, Qt…) s'installeront à la prochaine extinction ou au prochain redémarrage : compte 1 à 5 minutes de plus."
+    fi
+
+    [ -n "${ARRET:-}" ] && exit 0
+    if [ $echec = 0 ]; then
+        log "Flatpak"
+        telecharger flatpak update -y --noninteractive && installer flatpak uninstall -y --noninteractive --unused
+    fi
+
+    verifier_secureboot || {
+        echec=1
+        notifier critical "Secure Boot : problème de signature" "Un fichier de démarrage n'est pas signé, Linux pourrait ne plus démarrer. Demande à Claude (journalctl -u maj-auto)."
+    }
+
+    # Ce que l'automatisme ne fait pas lui-même : on prévient.
+    local aur
+    aur=$(runuser -u "$UTILISATEUR" -- yay -Qua 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
+    if [ -n "$aur" ] && [ "$aur" != "$(cat "$ETAT/aur-signale" 2>/dev/null)" ]; then
+        notifier normal "Paquets AUR à mettre à jour" "$aur— à faire avec Claude (non automatique : l'AUR n'est pas vérifié par Arch)."
+        echo "$aur" >"$ETAT/aur-signale"
+    fi
+    local pacnew
+    pacnew=$(find /etc -name '*.pacnew' 2>/dev/null | sort | tr '\n' ' ')
+    if [ -n "$pacnew" ] && [ "$pacnew" != "$(cat "$ETAT/pacnew-signale" 2>/dev/null)" ]; then
+        notifier normal "Fichiers de config à fusionner" "$pacnew— demande à Claude."
+        echo "$pacnew" >"$ETAT/pacnew-signale"
+    fi
+    local python_apres
+    python_apres=$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null)
+    if [ -n "$python_avant" ] && [ "$python_avant" != "$python_apres" ]; then
+        notifier critical "Python $python_avant → $python_apres" "Les paquets AUR en Python (pyprland…) doivent être recompilés : demande à Claude."
+    fi
+
+    paccache -rqk3
+    paccache -rquk0
+
+    if [ $echec = 0 ]; then
+        touch "$ETAT/derniere-reussite"
+        log "terminé"
+    else
+        touch "$ETAT/dernier-echec"
+        notifier critical "Mise à jour automatique échouée" "Nouvel essai dans 6 h. Détails : journalctl -u maj-auto (ou demande à Claude)."
+        exit 1
+    fi
+}
+
+config_hyprland_ok() { # le nouveau binaire accepte-t-il la config Lua d'Hugo ?
+    (cd / && runuser -u "$UTILISATEUR" -- env HOME="/home/$UTILISATEUR" timeout 60 \
+        Hyprland --verify-config --config "/home/$UTILISATEUR/.config/hypr/hyprland.lua" 2>&1) | grep -q "config ok"
+}
+
+hyprland_refuse() { # la version d'Hyprland proposée par le dépôt a-t-elle déjà été refusée ?
+    local v
+    v=$(pacman -Si hyprland-git 2>/dev/null | sed -n 's/^Version *: //p')
+    [ -n "$v" ] && [ "$v" = "$(cat "$ETAT/hyprland-refuse" 2>/dev/null)" ]
+}
+
+en_attente() { # paquets à mettre à jour, sans un Hyprland déjà refusé
+    if hyprland_refuse; then
+        pacman -Qu 2>/dev/null | grep -vE "$HYPR_PAQUETS"
+    else
+        pacman -Qu 2>/dev/null
+    fi
+}
+
+retour_hyprland() { # réinstalle depuis le cache pacman les versions notées avant la mise à jour
+    local nom version f fichiers=()
+    while read -r nom version; do
+        [ -n "$nom" ] || continue
+        [ "$(pacman -Q "$nom" 2>/dev/null | cut -d' ' -f2)" = "$version" ] && continue
+        f=$(ls /var/cache/pacman/pkg/"$nom-$version"-*.pkg.tar.zst 2>/dev/null | head -n 1)
+        [ -n "$f" ] && fichiers+=("$f")
+    done <<<"$1"
+    [ ${#fichiers[@]} -eq 0 ] || pacman -U --noconfirm "${fichiers[@]}"
+}
+
+extinction() {
+    [ -e "$ETAT/a-installer-extinction" ] || exit 0
+    if pgrep -x pacman >/dev/null; then
+        log "pacman déjà en cours, rien à l'extinction"
+        exit 0
+    fi
+    rm -f /var/lib/pacman/db.lck # verrou orphelin d'une passe tuée avant l'installation
+    log "Installation des mises à jour avant l'extinction (noyau, NVIDIA…) — NE PAS ÉTEINDRE LE PC."
+    local avant apres rapport hypr_avant ignorer=()
+    avant=$(pacman -Q linux nvidia-utils hyprland-git quickshell 2>/dev/null | tr '\n' ' ')
+    hypr_avant=$(pacman -Q | grep -E "$HYPR_PAQUETS")
+    # Version d'Hyprland déjà refusée par la config : on attend la suivante.
+    hyprland_refuse && ignorer=(--ignore 'hypr*-git,aquamarine-git,xdg-desktop-portal-hyprland-git')
+    if pacman -Su --noconfirm "${ignorer[@]}"; then
+        apres=$(pacman -Q linux nvidia-utils hyprland-git quickshell 2>/dev/null | tr '\n' ' ')
+        rapport="Avant : $avant
+Après : $apres"
+    else
+        rapport="ÉCHEC de l'installation à l'extinction. Détails : journalctl -b -1 -u maj-auto-extinction (ou demande à Claude)."
+    fi
+    if [ "$hypr_avant" != "$(pacman -Q | grep -E "$HYPR_PAQUETS")" ] && ! config_hyprland_ok; then
+        log "la nouvelle version d'Hyprland refuse la config : retour à l'ancienne"
+        pacman -Q hyprland-git | cut -d' ' -f2 >"$ETAT/hyprland-refuse"
+        retour_hyprland "$hypr_avant"
+        rapport="$rapport
+Hyprland : la nouvelle version refusait ta config, l'ancienne a été remise (demande à Claude)."
+    fi
+    if ! verifier_noyau; then
+        rapport="$rapport
+ATTENTION : vérification du noyau/NVIDIA/Secure Boot en échec, voir journalctl -b -1 -u maj-auto-extinction."
+    fi
+    [ -z "$(en_attente)" ] && rm -f "$ETAT/a-installer-extinction"
+    echo "$rapport" >"$ETAT/rapport-extinction"
+    log "$rapport"
+}
+
+case "${1:-}" in
+fond) fond ;;
+maintenant) MAINTENANT=1 fond; echo "Terminé. Journal : journalctl -u maj-auto (le noyau/NVIDIA/Hyprland/Qt s'installeront à l'extinction)." ;;
+extinction) extinction ;;
+news-lue) touch "$ETAT/news-lue" && echo "OK : les mises à jour automatiques reprennent." ;;
+*)
+    echo "usage : maj-auto fond|maintenant|extinction|news-lue" >&2
+    exit 2
+    ;;
+esac

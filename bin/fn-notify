@@ -1,0 +1,54 @@
+#!/bin/bash
+# Notification unifiée style OSD pour toutes les touches Fn ASUS
+# Usage: fn-notify <action> [valeur]
+
+case "$1" in
+    profile)
+        PROFILE=$(asusctl profile get 2>/dev/null | awk '/^Active profile:/ {print $NF}')
+        case "$PROFILE" in
+            Quiet)       ICON="󰖃"; LABEL="Silence"     ; VAL=25 ;;
+            Balanced)    ICON="󰖙"; LABEL="Équilibré"   ; VAL=50 ;;
+            Performance) ICON="󰈸"; LABEL="Performance" ; VAL=100 ;;
+            Custom)      ICON="󰒓"; LABEL="Custom"      ; VAL=75 ;;
+            *)           ICON="󰖙"; LABEL="$PROFILE"    ; VAL=50 ;;
+        esac
+        notify-send \
+            -h string:x-canonical-private-synchronous:fn-profile \
+            -h int:value:$VAL \
+            -t 2000 \
+            "$ICON Profil ROG" "$LABEL"
+        ;;
+
+    aura)
+        MODE=$(asusctl aura --current-mode 2>/dev/null | awk '{print $NF}' || echo "?")
+        notify-send \
+            -h string:x-canonical-private-synchronous:fn-aura \
+            -t 2000 \
+            "󰌶 Aura RGB" "Mode: $MODE"
+        ;;
+
+    display)
+        notify-send \
+            -h string:x-canonical-private-synchronous:fn-display \
+            -t 1500 \
+            "󰍹 Affichage" "Ouverture du gestionnaire d'écrans…"
+        wdisplays &
+        ;;
+
+    airplane)
+        STATE=$(rfkill list wifi | grep -i "soft blocked: yes" && echo "ON" || echo "OFF")
+        if [[ "$STATE" == "ON" ]]; then
+            rfkill unblock all
+            notify-send -h string:x-canonical-private-synchronous:fn-airplane -t 2000 "󰀤 Mode avion" "Désactivé — Wifi et BT actifs"
+        else
+            rfkill block all
+            notify-send -h string:x-canonical-private-synchronous:fn-airplane -t 2000 "󰀝 Mode avion" "Activé — Toutes radios coupées"
+        fi
+        ;;
+
+    sleep)
+        notify-send -u low -t 1000 "󰒲 Mise en veille" "À bientôt…"
+        sleep 0.8
+        systemctl suspend
+        ;;
+esac

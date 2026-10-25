@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Correction des franges de couleur du QD-OLED AOC Q27G4SDR (DP-3).
+
+Les pixels QD-OLED Samsung sont des triangles : vert en haut, rouge en bas à
+gauche, bleu en bas à droite. Un texte clair sur fond sombre a donc un liseré
+vert au-dessus et rouge/magenta en dessous. Un shader d'écran Hyprland
+rééchantillonne chaque canal à la position réelle de son sous-pixel (en lumière
+linéaire) ; il n'agit que sur la résolution de l'écran QD-OLED, les autres
+écrans passent tels quels.
+
+  oled-fringe daemon          service (oled-fringe.service) : applique/retire le
+                              shader selon l'état, le plein écran et les reloads
+  oled-fringe on|off|toggle   active / désactive (persistant)
+  oled-fringe strength N      intensité en % (100 = géométrie théorique)
+  oled-fringe preset NOM      complet (défaut, choisi par Hugo le 13/10) | net (vert intact)
+  oled-fringe ab NOM1 NOM2    alterne 2 presets toutes les 3 s (le 2e a un petit carré
+                              rose en haut à gauche) ; Ctrl+C ou fin après 10 min
+  oled-fringe status          état courant
+  oled-fringe marker on|off   bande magenta en haut de l'écran (test d'orientation)
+
+État : ~/.config/hypr/oled-fringe.json — shader : ~/.config/hypr/shaders/qdoled-fringe.frag
+Le shader est coupé quand une fenêtre plein écran (jeu, vidéo) occupe l'écran,
+et laissé de côté si un autre shader d'écran est actif (anti-flashbang d'ii).
+"""
+import glob
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+STATE = f"{HOME}/.config/hypr/oled-fringe.json"
+SHADER = f"{HOME}/.config/hypr/shaders/qdoled-fringe.frag"
+MONITOR_MODEL = "Q27G4SDR"  # AOC QD-OLED, cf. `hyprctl monitors -j`
+DEFAULTS = {"enabled": True, "strength": 100, "preset": "complet", "fullscreen_off": True, "marker": False}
+
+# Décalages de rééchantillonnage à 100 %, en pixels : (vert vers le haut,
+# rouge/bleu vers le bas, rouge à gauche / bleu à droite). Le vert et le
+# rouge/bleu sont à ~0,5 px l'un de l'autre verticalement.
+#  - net : on ne touche pas au vert (70 % de la luminance) → texte net ; seuls
+#          rouge et bleu, peu visibles pour l'œil en netteté, sont recalés.
+#  - complet : on répartit sur les 3 canaux et on corrige aussi l'horizontale
+#          (liseré rouge à gauche / bleu à droite) ; un peu plus doux.
+PRESETS = {"net": (0.0, 0.5, 0.0), "complet": (0.25, 0.25, 0.20)}
+
+SHADER_TEMPLATE = """#version 300 es
+// Généré par ~/.local/bin/oled-fringe — ne pas éditer à la main.
+// Compensation des franges QD-OLED (vert en haut, rouge bas-gauche, bleu bas-droite)
+// sur le seul framebuffer {w}x{h} ; les autres écrans passent tels quels.
+precision highp float;
+in vec2 v_texcoord;
+uniform sampler2D tex;
+out vec4 fragColor;
+
+const ivec2 TARGET = ivec2({w}, {h});
+const float VG = {vg:.4f};
+const float VRB = {vrb:.4f};
+const float H = {hh:.4f};
+const int MARKER = {marker};  // 0 rien, 1 bande en haut, 2 petit carré en haut à gauche
+
+vec3 lin(vec3 c) {{ return pow(max(c, vec3(0.0)), vec3(2.2)); }}
+vec3 enc(vec3 c) {{ return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)); }}
+
+void main() {{
+    // Sens de l'écran : la ligne 0 du buffer de sortie est le haut de la dalle et
+    // gl_FragCoord.y croît vers le bas ; on suit v_texcoord dans ce sens.
+    // (Dérivées calculées avant tout branchement.)
+    float dy = dFdy(v_texcoord.y);
+    float dx = dFdx(v_texcoord.x);
+    vec4 c = texture(tex, v_texcoord);
+    ivec2 size = textureSize(tex, 0);
+    if (size != TARGET) {{ fragColor = c; return; }}
+
+    if (MARKER == 1 && gl_FragCoord.y < 24.0) {{ fragColor = vec4(1.0, 0.0, 1.0, 1.0); return; }}
+    if (MARKER == 2 && gl_FragCoord.y < 10.0 && gl_FragCoord.x < 10.0) {{ fragColor = vec4(1.0, 0.0, 1.0, 1.0); return; }}
+
+    ivec2 down = ivec2(0, dy > 0.0 ? 1 : -1);
+    ivec2 right = ivec2(dx > 0.0 ? 1 : -1, 0);
+    ivec2 p = clamp(ivec2(floor(v_texcoord * vec2(size))), ivec2(0), size - 1);
+    ivec2 hi = size - 1;
+
+    vec3 c0 = lin(texelFetch(tex, p, 0).rgb);
+    vec3 cu = lin(texelFetch(tex, clamp(p - down, ivec2(0), hi), 0).rgb);
+    vec3 cd = lin(texelFetch(tex, clamp(p + down, ivec2(0), hi), 0).rgb);
+    vec3 cl = lin(texelFetch(tex, clamp(p - right, ivec2(0), hi), 0).rgb);
+    vec3 cr = lin(texelFetch(tex, clamp(p + right, ivec2(0), hi), 0).rgb);
+    vec3 cdl = lin(texelFetch(tex, clamp(p + down - right, ivec2(0), hi), 0).rgb);
+    vec3 cdr = lin(texelFetch(tex, clamp(p + down + right, ivec2(0), hi), 0).rgb);
+
+    float g = mix(c0.g, cu.g, VG);
+    float r = mix(mix(c0.r, cd.r, VRB), mix(cl.r, cdl.r, VRB), H);
+    float b = mix(mix(c0.b, cd.b, VRB), mix(cr.b, cdr.b, VRB), H);
+
+    fragColor = vec4(enc(vec3(r, g, b)), c.a);
+}}
+"""
+
+
+def load_state():
+    st = dict(DEFAULTS)
+    try:
+        with open(STATE) as f:
+            st.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return st
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w") as f:
+        json.dump(st, f, indent=2)
+        f.write("\n")
+
+
+def instance_env():
+    """Environnement avec la signature de l'instance Hyprland la plus récente."""
+    env = dict(os.environ)
+    runtime = env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    socks = sorted(glob.glob(f"{runtime}/hypr/*/.socket.sock"), key=os.path.getmtime)
+    if socks:
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = os.path.basename(os.path.dirname(socks[-1]))
+    return env
+
+
+def hyprctl(*args):
+    r = subprocess.run(["hyprctl", *args], capture_output=True, text=True, timeout=5, env=instance_env())
+    return r.stdout
+
+
+def hyprctl_json(*args):
+    try:
+        return json.loads(hyprctl(*args, "-j"))
+    except (ValueError, subprocess.SubprocessError):
+        return None
+
+
+def target_monitor():
+    mons = hyprctl_json("monitors") or []
+    for m in mons:
+        if MONITOR_MODEL in (m.get("model", "") + m.get("description", "")):
+            return m, mons
+    return None, mons
+
+
+def shader_source(st, w, h, marker=None):
+    k = max(0, min(200, int(st.get("strength", 100)))) / 100
+    vg, vrb, hh = PRESETS.get(st.get("preset"), PRESETS["net"])
+    if marker is None:
+        marker = 1 if st.get("marker") else 0
+    return SHADER_TEMPLATE.format(w=w, h=h, vg=vg * k, vrb=vrb * k, hh=hh * k, marker=marker)
+
+
+def write_shader(st, w, h, path=SHADER, marker=None):
+    src = shader_source(st, w, h, marker)
+    try:
+        with open(path) as f:
+            if f.read() == src:
+                return False
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Validation hors ligne : jamais de shader cassé dans Hyprland.
+    with tempfile.NamedTemporaryFile("w", suffix=".frag", delete=False) as t:
+        t.write(src)
+    try:
+        r = subprocess.run(["glslangValidator", t.name], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("shader invalide :\n" + r.stdout + r.stderr)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.unlink(t.name)
+    with open(path, "w") as f:
+        f.write(src)
+    return True
+
+
+def current_shader():
+    opt = hyprctl_json("getoption", "decoration:screen_shader") or {}
+    val = (opt.get("str", "") or "").strip()
+    return "" if val == "[[EMPTY]]" else val  # Hyprland affiche « [[EMPTY]] » pour une valeur vide
+
+
+def set_shader(path):
+    lua = "hl.config({ decoration = { screen_shader = %s } })" % json.dumps(path)
+    hyprctl("eval", lua)
+
+
+def has_fullscreen_on(mon):
+    """Vrai plein écran (jeu, vidéo) sur l'espace visible ; une fenêtre maximisée ne compte pas."""
+    ws_id = (mon.get("activeWorkspace") or {}).get("id")
+    return any((c.get("workspace") or {}).get("id") == ws_id and int(c.get("fullscreen") or 0) & 2
+               for c in hyprctl_json("clients") or [])
+
+
+def reconcile(force_reload=False):
+    """Met Hyprland dans l'état voulu. Sans état interne : CLI et service peuvent l'appeler."""
+    st = load_state()
+    mon, mons = target_monitor()
+    want = ""
+    if st["enabled"] and mon:
+        same_size = [m["name"] for m in mons
+                     if (m["width"], m["height"]) == (mon["width"], mon["height"]) and m is not mon]
+        if same_size:
+            print(f"attention : {same_size} a la même résolution que {mon['name']} et sera corrigé aussi",
+                  file=sys.stderr)
+        changed = write_shader(st, mon["width"], mon["height"])
+        force_reload = force_reload or changed
+        if not (st.get("fullscreen_off", True) and has_fullscreen_on(mon)):
+            want = SHADER
+    cur = current_shader()
+    if cur and not cur.startswith(os.path.dirname(SHADER) + "/"):
+        return cur  # un autre shader d'écran (anti-flashbang d'ii) a la priorité
+    if want and force_reload and cur == SHADER:
+        set_shader("")
+        cur = ""
+    if cur != want:
+        set_shader(want)
+    return want
+
+
+RELEVANT = ("fullscreen", "workspace", "workspacev2", "focusedmon", "focusedmonv2", "openwindow",
+            "closewindow", "movewindow", "movewindowv2", "monitoradded", "monitoraddedv2",
+            "monitorremoved", "monitorremovedv2", "configreloaded", "activewindowv2")
+
+
+def daemon():
+    while True:
+        env = instance_env()
+        sig = env.get("HYPRLAND_INSTANCE_SIGNATURE")
+        path = f"{env.get('XDG_RUNTIME_DIR', '/run/user/%d' % os.getuid())}/hypr/{sig}/.socket2.sock"
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(path)
+        except OSError:
+            time.sleep(2)
+            continue
+        s.settimeout(1.0)
+        reconcile()
+        buf, dirty, last_check = b"", False, time.monotonic()
+        try:
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    *lines, buf = buf.split(b"\n")
+                    for line in lines:
+                        ev = line.split(b">>", 1)[0].decode(errors="replace")
+                        if ev in RELEVANT:
+                            dirty = True
+                except socket.timeout:
+                    pass
+                now = time.monotonic()
+                if dirty or now - last_check > 10:  # filet de sécurité toutes les 10 s
+                    time.sleep(0.05)
+                    reconcile()
+                    dirty, last_check = False, now
+        except OSError:
+            pass
+        finally:
+            s.close()
+        time.sleep(1)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    st = load_state()
+    if cmd == "daemon":
+        daemon()
+    elif cmd in ("on", "off", "toggle"):
+        st["enabled"] = {"on": True, "off": False}.get(cmd, not st["enabled"])
+        save_state(st)
+        reconcile()
+        print("activé" if st["enabled"] else "désactivé")
+    elif cmd == "strength" and len(sys.argv) > 2:
+        st["strength"] = max(0, min(200, int(sys.argv[2])))
+        save_state(st)
+        reconcile(force_reload=True)
+        print(f"intensité {st['strength']} %")
+    elif cmd == "preset" and len(sys.argv) > 2 and sys.argv[2] in PRESETS:
+        st["preset"] = sys.argv[2]
+        save_state(st)
+        reconcile(force_reload=True)
+        print(f"preset {st['preset']}")
+    elif cmd == "ab" and len(sys.argv) > 3 and sys.argv[2] in PRESETS and sys.argv[3] in PRESETS:
+        mon, _ = target_monitor()
+        if not mon:
+            sys.exit("écran QD-OLED absent")
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # pour passer par le finally
+        files = []
+        for i, name in enumerate(sys.argv[2:4]):
+            path = f"{os.path.dirname(SHADER)}/ab-{i}.frag"
+            write_shader({**st, "preset": name}, mon["width"], mon["height"], path, marker=2 * i)
+            files.append(path)
+        try:
+            for _ in range(100):
+                for path in files:
+                    set_shader(path)
+                    time.sleep(3)
+        finally:
+            set_shader("")
+            reconcile(force_reload=True)
+    elif cmd == "marker" and len(sys.argv) > 2:
+        st["marker"] = sys.argv[2] == "on"
+        save_state(st)
+        reconcile(force_reload=True)
+    elif cmd == "status":
+        mon, _ = target_monitor()
+        print(json.dumps({**st, "monitor": mon["name"] if mon else None,
+                          "screen_shader": current_shader()}, ensure_ascii=False, indent=2))
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

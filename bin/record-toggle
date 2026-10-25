@@ -1,0 +1,46 @@
+#!/bin/bash
+# Toggle screen recording — gpu-screen-recorder
+# SUPER+SHIFT+R = plein écran | SUPER+CTRL+R = région sélectionnée
+
+export XDG_RUNTIME_DIR=/run/user/1000
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1000/bus"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
+
+OUTDIR="$HOME/Videos/recordings"
+PIDFILE="/tmp/gsr.pid"
+mkdir -p "$OUTDIR"
+
+_notify() {
+    notify-send -i "camera-video" "Enregistrement" "$1" -t 3000 2>/dev/null
+}
+
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    # Arrêter — SIGINT sauvegarde proprement
+    kill -SIGINT "$(cat "$PIDFILE")"
+    rm -f "$PIDFILE"
+    sleep 1.5
+    LAST=$(ls -t "$OUTDIR"/*.mkv 2>/dev/null | head -1)
+    SIZE=$(du -sh "$LAST" 2>/dev/null | cut -f1)
+    _notify "Arrêté · $(basename "${LAST:-?}") · ${SIZE:-?}"
+else
+    rm -f "$PIDFILE"
+    MODE="${1:-fullscreen}"
+    FILE="$OUTDIR/$(date +%Y-%m-%d_%H-%M-%S).mkv"
+    BASE_ARGS="-k h264 -fallback-cpu-encoding yes -f 60 -q very_high"
+
+    if [ "$MODE" = "region" ]; then
+        READ=$(slurp -f '%x,%y %wx%h' 2>/dev/null) || exit 0
+        X=$(echo "$READ" | awk -F'[, ]' '{print $1}')
+        Y=$(echo "$READ" | awk -F'[, ]' '{print $2}')
+        W=$(echo "$READ" | awk '{split($2,a,"x"); print a[1]}')
+        H=$(echo "$READ" | awk '{split($2,a,"x"); print a[2]}')
+        _notify "⏺ Région · SUPER+SHIFT+R pour arrêter"
+        gpu-screen-recorder -w region -region "${W}x${H}+${X}+${Y}" \
+            $BASE_ARGS -a default_output -o "$FILE" &>/tmp/gsr.log &
+    else
+        _notify "⏺ Plein écran · SUPER+SHIFT+R pour arrêter"
+        gpu-screen-recorder -w eDP-1 \
+            $BASE_ARGS -a default_output -o "$FILE" &>/tmp/gsr.log &
+    fi
+    echo $! > "$PIDFILE"
+fi

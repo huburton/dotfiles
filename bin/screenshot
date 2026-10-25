@@ -1,0 +1,40 @@
+#!/bin/bash
+# screenshot MODE — region | output | window
+
+MODE="${1:-region}"
+DIR="$HOME/Pictures/screenshots"
+mkdir -p "$DIR"
+FILE="$DIR/$(date +%Y-%m-%d_%H-%M-%S).png"
+
+_copy_to_clipboard() {
+    wl-copy --type image/png < "$1"
+}
+
+_notify() {
+    local file="$1"
+    local msg="$2"
+    # Notification cliquable qui ouvre le fichier dans eog/imv
+    notify-send -i "$file" "Screenshot" "$msg — tapez 'sc' dans kitty pour l'aperçu" -t 3000
+}
+
+case "$MODE" in
+    region)
+        GEOM=$(slurp 2>/dev/null) || exit 0
+        grim -g "$GEOM" "$FILE" || exit 1
+        _copy_to_clipboard "$FILE"
+        _notify "$FILE" "Zone copiée"
+        ;;
+    output)
+        grim "$FILE" || exit 1
+        _copy_to_clipboard "$FILE"
+        _notify "$FILE" "Écran copié"
+        ;;
+    window)
+        GEOM=$(hyprctl activewindow -j | python3 -c \
+            "import sys,json; w=json.load(sys.stdin); a=w['at']; s=w['size']; print(f'{a[0]},{a[1]} {s[0]}x{s[1]}')" 2>/dev/null)
+        [ -z "$GEOM" ] && exit 1
+        grim -g "$GEOM" "$FILE" || exit 1
+        _copy_to_clipboard "$FILE"
+        _notify "$FILE" "Fenêtre copiée"
+        ;;
+esac

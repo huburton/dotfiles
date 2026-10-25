@@ -1,0 +1,10 @@
+[Unit]
+Description=Cacher les applis techniques du lanceur (~/.config/hidden-apps.list)
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hide-apps
+
+[Install]
+WantedBy=default.target

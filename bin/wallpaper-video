@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Fond d'écran vidéo supervisé (remplace les mpvpaper lancés à la main).
+
+Un seul mpvpaper pour tous les écrans (une seule décodeuse, ~1,5 Go de VRAM au
+lieu de ~1,3 Go PAR écran), lancé par le service utilisateur wallpaper-video.
+
+Garde-fous — jamais de fond d'écran qui mange le CPU :
+  - pilote NVIDIA vérifié avant de lancer la vidéo (nvidia-smi). Après une mise à
+    jour du pilote sans redémarrage, le décodage et le rendu basculaient sur le
+    CPU (500 % le 13/10/2026) ;
+  - si mpvpaper consomme plus de CPU_LIMIT % d'un cœur pendant 30 s, il est
+    arrêté ;
+  - au-delà de RSS_LIMIT_MB, il est relancé (fuite mémoire) ;
+  - dans ces cas : image fixe (vignette générée par ii) + notification.
+
+  wallpaper-video run            boucle du service (wallpaper-video.service)
+  wallpaper-video set FICHIER    choisit la vidéo (copiée sur le disque local si elle est sur le NFS)
+  wallpaper-video stop           fond image choisi dans ii : plus de vidéo
+  wallpaper-video pause|resume   mode IA (ai-mode) : image fixe pour libérer la VRAM, puis reprise
+  wallpaper-video status
+"""
+import glob
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE = f"{HOME}/.config/hypr/wallpaper-video.json"
+LOCAL_DIR = os.path.join("/var/home-local", os.environ.get("USER", ""), "wallpapers")
+II_CONFIG = f"{HOME}/.config/illogical-impulse/config.json"
+PAUSE_FLAG = f"{os.environ.get('XDG_RUNTIME_DIR', '/run/user/%d' % os.getuid())}/wallpaper-video.paused"
+VRAM_MIN_MB = 2000   # en dessous, nvdec échoue et mpv décode au CPU (cas du mode IA)
+MPV_OPTS = ("really-quiet no-audio loop hwdec=auto scale=bilinear interpolation=no "
+            "panscan=1.0 video-scale-x=1.0 video-scale-y=1.0 video-align-x=0.5 "
+            "video-align-y=0.5 load-scripts=no")
+CPU_LIMIT = 40       # % d'un cœur, moyenne sur CPU_WINDOW secondes
+CPU_WINDOW = 30
+RSS_LIMIT_MB = 2500
+GPU_RETRY = 300      # s entre deux vérifications du pilote quand il est cassé
+TICK = 5
+
+running = True
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def notify(title, body):
+    subprocess.run(["notify-send", "-a", "Fond d'écran", "-i", "video-display", title, body],
+                   capture_output=True, timeout=10, env=session_env())
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"video": None}
+
+
+def save_state(st):
+    with open(STATE, "w") as f:
+        json.dump(st, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def session_env():
+    """Variables Wayland/Hyprland de la session en cours, même si le service a démarré avant."""
+    env = dict(os.environ)
+    runtime = env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    socks = sorted(glob.glob(f"{runtime}/hypr/*/.socket.sock"), key=os.path.getmtime)
+    if socks:
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = os.path.basename(os.path.dirname(socks[-1]))
+    for name in ("wayland-1", "wayland-0"):
+        if os.path.exists(f"{runtime}/{name}"):
+            env["WAYLAND_DISPLAY"] = name
+            break
+    return env
+
+
+def session_ready():
+    env = session_env()
+    if "WAYLAND_DISPLAY" not in env or "HYPRLAND_INSTANCE_SIGNATURE" not in env:
+        return False
+    r = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, env=env)
+    try:
+        return r.returncode == 0 and len(json.loads(r.stdout)) > 0
+    except ValueError:
+        return False
+
+
+def gpu_ok():
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version,memory.free", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "nvidia-smi ne répond pas"
+    if r.returncode != 0:
+        return False, (r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else "erreur"
+    driver, free = [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")]
+    if int(free) < VRAM_MIN_MB:
+        return False, f"VRAM libre {free} Mo (modèle local chargé ?)"
+    return True, driver
+
+
+def thumbnail():
+    try:
+        with open(II_CONFIG) as f:
+            p = json.load(f)["background"]["thumbnailPath"]
+        return p if os.path.isfile(p) else None
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def proc_cpu_seconds(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def proc_rss_mb(pid):
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return 0
+
+
+def video_running():
+    """Un mpvpaper de fond lancé par ce service tourne-t-il ?"""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                if f.read().startswith(b"mpvpaper\0-p\0"):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def kill_strays():
+    """mpvpaper de fond lancés hors du service (ancien script de restauration, switchwall)."""
+    me = os.getpid()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]) == b"mpvpaper" and b"overlay" not in argv:
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def stop(child):
+    if child and child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+
+
+def start_static():
+    img = thumbnail()
+    if not img or not shutil.which("swaybg"):
+        return None
+    return subprocess.Popen(["swaybg", "-o", "*", "-i", img, "-m", "fill"], env=session_env(),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def run():
+    global running
+
+    def on_term(*_):
+        global running
+        running = False
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+
+    child = None          # mpvpaper ou swaybg
+    mode = None           # "video" | "static" | None
+    video = None
+    degraded_until = 0
+    crashes = []
+    samples = []          # (t, cpu_seconds)
+    notified = set()
+    state_mtime = None
+    was_paused = False
+
+    while running:
+        try:
+            mtime = os.path.getmtime(STATE)
+        except OSError:
+            mtime = None
+        want = load_state().get("video")
+        if want and not os.path.isfile(want):
+            want = None
+        paused = os.path.exists(PAUSE_FLAG)
+        changed = mtime != state_mtime or want != video or paused != was_paused
+        state_mtime, was_paused = mtime, paused
+
+        if not session_ready():
+            stop(child); child, mode = None, None
+            time.sleep(2)
+            continue
+
+        if changed:
+            stop(child); child, mode, video = None, None, want
+            degraded_until, crashes, samples = 0, [], []
+
+        if not video:
+            if child:
+                stop(child); child, mode = None, None
+            time.sleep(TICK)
+            continue
+
+        if paused:  # mode IA : image fixe (swaybg, sans GPU) tant que la pause dure
+            if mode != "static":
+                stop(child)
+                child = start_static()
+                mode = "static" if child else "paused"
+            time.sleep(1)
+            continue
+
+        now = time.monotonic()
+        if mode == "video" and child.poll() is not None:
+            log(f"mpvpaper s'est arrêté (code {child.returncode})")
+            crashes = [t for t in crashes if now - t < 600] + [now]
+            child, mode = None, None
+            if len(crashes) >= 5:
+                degraded_until = now + GPU_RETRY
+                if "crash" not in notified:
+                    notify("Fond animé en pause", "mpvpaper plante en boucle : image fixe à la place.")
+                    notified.add("crash")
+            else:
+                time.sleep(min(60, 2 ** len(crashes)))
+                continue
+
+        if mode != "video" and now >= degraded_until:
+            ok, why = gpu_ok()
+            if ok:
+                stop(child)
+                kill_strays()
+                child = subprocess.Popen(["mpvpaper", "-p", "-o", MPV_OPTS, "*", video],
+                                         env=session_env(), stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+                mode, samples = "video", []
+                log(f"vidéo lancée (pid {child.pid}) : {video}")
+            elif why.startswith("VRAM"):
+                degraded_until = now + 30  # modèle en cours de déchargement : on réessaie bientôt
+                log(why)
+            else:
+                degraded_until = now + GPU_RETRY
+                log(f"pilote NVIDIA indisponible : {why}")
+                if "gpu" not in notified:
+                    notify("Fond animé en pause",
+                           "Le pilote NVIDIA ne répond pas (mise à jour en attente de redémarrage ?). "
+                           "Image fixe en attendant ; redémarre pour retrouver le fond animé.")
+                    notified.add("gpu")
+
+        if mode is None:  # pas de vidéo possible pour l'instant : image fixe
+            child = start_static()
+            mode = "static" if child else None
+
+        if mode == "video":
+            cpu = proc_cpu_seconds(child.pid)
+            if cpu is not None:
+                samples = [(t, c) for t, c in samples if now - t <= CPU_WINDOW] + [(now, cpu)]
+                t0, c0 = samples[0]
+                if now - t0 >= CPU_WINDOW - TICK:
+                    pct = 100 * (cpu - c0) / (now - t0)
+                    if pct > CPU_LIMIT:
+                        log(f"mpvpaper à {pct:.0f} % CPU : arrêt, image fixe")
+                        stop(child)
+                        child, mode = start_static(), "static"
+                        degraded_until = now + GPU_RETRY
+                        if "cpu" not in notified:
+                            notify("Fond animé en pause",
+                                   f"La vidéo de fond utilisait {pct:.0f} % de CPU (décodage logiciel). "
+                                   "Image fixe à la place ; nouvel essai dans 5 min.")
+                            notified.add("cpu")
+                        continue
+            rss = proc_rss_mb(child.pid)
+            if rss > RSS_LIMIT_MB:
+                log(f"mpvpaper à {rss:.0f} Mo : relance")
+                stop(child)
+                child, mode = None, None
+                continue
+
+        time.sleep(TICK)
+
+    stop(child)
+
+
+def localize(path):
+    """Les vidéos lues depuis le home NFS saturaient le réseau : copie locale."""
+    path = os.path.realpath(path)
+    if path.startswith(LOCAL_DIR + "/") or not path.startswith(HOME + "/"):
+        return path
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    dst = os.path.join(LOCAL_DIR, os.path.basename(path))
+    if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(path):
+        shutil.copy2(path, dst + ".tmp")
+        os.replace(dst + ".tmp", dst)
+    return dst
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "run":
+        run()
+    elif cmd == "set" and len(sys.argv) > 2:
+        save_state({"video": localize(sys.argv[2])})
+        subprocess.run(["systemctl", "--user", "start", "wallpaper-video.service"])
+    elif cmd == "stop":
+        save_state({"video": None})
+    elif cmd == "pause":
+        open(PAUSE_FLAG, "w").close()
+        for _ in range(40):  # attend que la VRAM soit rendue (ai-mode charge ensuite le modèle)
+            if not video_running():
+                break
+            time.sleep(0.25)
+    elif cmd == "resume":
+        try:
+            os.unlink(PAUSE_FLAG)
+        except FileNotFoundError:
+            pass
+    elif cmd == "status":
+        st = load_state()
+        r = subprocess.run(["systemctl", "--user", "is-active", "wallpaper-video.service"],
+                           capture_output=True, text=True)
+        print(json.dumps({**st, "paused": os.path.exists(PAUSE_FLAG), "service": r.stdout.strip(),
+                          "gpu": gpu_ok()}, ensure_ascii=False, indent=2))
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

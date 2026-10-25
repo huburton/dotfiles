@@ -1,0 +1,9 @@
+[Unit]
+Description=Vérifie chaque heure s'il faut lancer les mises à jour (une vraie passe toutes les 20 h)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target

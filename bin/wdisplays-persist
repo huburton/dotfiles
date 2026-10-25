@@ -1,0 +1,11 @@
+#!/bin/bash
+# wdisplays applies monitor layouts live but saves nothing: persist the live
+# layout (hypr-monitors-save) while it is open and when it closes.
+save="$(dirname "$(readlink -f "$0")")/hypr-monitors-save"
+wdisplays "$@" &
+pid=$!
+while kill -0 "$pid" 2>/dev/null; do
+    sleep 2
+    "$save" >/dev/null
+done
+"$save"

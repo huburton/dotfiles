@@ -1,0 +1,12 @@
+[Unit]
+Description=Fond d'écran vidéo (un seul mpvpaper, garde-fous GPU/CPU)
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=%h/.local/bin/wallpaper-video run
+Restart=always
+RestartSec=3
+Nice=10
+
+[Install]
+WantedBy=default.target

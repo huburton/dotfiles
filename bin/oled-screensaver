@@ -1,0 +1,53 @@
+#!/bin/bash
+# OLED screensaver: after 2 min idle (hypridle), cover every monitor, bar
+# included, with the looping video on the overlay layer so no static pixel
+# (task bar) stays lit. Any input (hypridle on-resume) stops it.
+# Usage: oled-screensaver start|stop
+# Un seul mpvpaper pour tous les écrans (« * ») ; le fond (wallpaper-video,
+# mpvpaper -p) se met en pause pendant qu'il est caché.
+VIDEO="/var/home-local/$USER/wallpapers/LoopingBackground13-3440.mp4"  # copie locale 3440 px HEVC (l'original 4K à 115 Mbit/s était lu depuis le NFS)
+VIDEO_SMALL="/var/home-local/$USER/wallpapers/LoopingBackground13-720.mp4"  # 720p H.264 pour le décodage logiciel
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/oled-screensaver.pids"
+DPMSFILE="${XDG_RUNTIME_DIR:-/tmp}/oled-screensaver.dpms"
+
+oled_monitor() { hyprctl monitors -j | jq -r '.[] | select(.description | test("Q27G4SDR")) | .name'; }
+
+case "$1" in
+    start)
+        [ -s "$PIDFILE" ] && exit 0
+        [ -f "$VIDEO" ] || exit 1
+        if ! nvidia-smi --query-gpu=driver_version --format=csv,noheader >/dev/null 2>&1; then
+            # Pilote NVIDIA indisponible (mise à jour sans redémarrage) : pas de vidéo,
+            # qui partirait sur le CPU ; on éteint seulement l'écran OLED.
+            mon=$(oled_monitor)
+            [ -n "$mon" ] && hyprctl dispatch "hl.dsp.dpms({ action = \"off\", monitor = \"$mon\" })" >/dev/null && echo "$mon" > "$DPMSFILE"
+            exit 0
+        fi
+        if [ -e "${XDG_RUNTIME_DIR:-/tmp}/ai-mode" ]; then
+            # Mode IA (ai-mode) : la VRAM est prise par le modèle local ; on ne protège que
+            # l'écran OLED, en décodage logiciel d'une copie 720p (léger pour le CPU).
+            target=$(oled_monitor)
+            opts="no-audio loop hwdec=no panscan=1.0 load-scripts=no"
+            [ -f "$VIDEO_SMALL" ] && VIDEO="$VIDEO_SMALL"
+        else
+            target="*"
+            opts="no-audio loop hwdec=auto panscan=1.0 load-scripts=no"
+        fi
+        [ -n "$target" ] || exit 0
+        mpvpaper -l overlay -o "$opts" "$target" "$VIDEO" >/dev/null 2>&1 &
+        echo $! >> "$PIDFILE"
+        ;;
+    stop)
+        if [ -f "$DPMSFILE" ]; then
+            hyprctl dispatch "hl.dsp.dpms({ action = \"on\", monitor = \"$(cat "$DPMSFILE")\" })" >/dev/null
+            rm -f "$DPMSFILE"
+        fi
+        [ -f "$PIDFILE" ] || exit 0
+        xargs -r kill -9 < "$PIDFILE" 2>/dev/null # instant: TERM left it up ~0.4 s after input
+        rm -f "$PIDFILE"
+        ;;
+    *)
+        echo "Usage: $0 start|stop" >&2
+        exit 1
+        ;;
+esac

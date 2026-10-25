@@ -1,0 +1,57 @@
+#!/bin/bash
+BINDS="󰌌  RACCOURCIS HYPRLAND ─ ASUS ROG G16
+─────────────────────────────────────────
+ Apps
+  SUPER + Entrée       → Terminal (kitty)
+  SUPER + Espace       → Lanceur d'apps (wofi)
+  SUPER + E            → Fichiers (Thunar)
+  SUPER + B            → Zen Browser
+  SUPER + A            → ROG Control Center (LED, Aura)
+  SUPER + S            → Volume (pavucontrol)
+  SUPER + CTRL + T     → Thème GTK (nwg-look)
+  SUPER + SHIFT + D    → Gestion écrans (wdisplays)
+  SUPER + V            → Presse-papier avec historique
+  SUPER + SHIFT + ?    → Cette aide
+
+ Fenêtres
+  SUPER + Q            → Fermer la fenêtre
+  SUPER + F            → Plein écran
+  SUPER + SHIFT + F    → Flottant
+  SUPER + -            → Minimiser (scratchpad)
+  SUPER + SHIFT + -    → Restaurer minimisé
+  SUPER + ←→↑↓         → Changer focus
+  SUPER + SHIFT + ←→↑↓ → Déplacer fenêtre
+  SUPER + CTRL + ←→↑↓  → Redimensionner
+
+ Workspaces (AZERTY)
+  SUPER + &éàçè...     → Workspace 1-10
+  SUPER + SHIFT + ...  → Déplacer fenêtre
+  SUPER + Molette      → Workspace suivant/préc
+  3 doigts trackpad ←→ → Workspace suivant/préc (macOS-style)
+
+ Touches Fn ASUS
+  F2 / F3              → Rétroéclairage clavier ↓↑
+  F4                   → Profil performance (Silencieux/Balanced/Boost)
+  F5                   → Gestion affichage
+  Fn+F6 / Impr         → Screenshot écran entier
+  SHIFT + Fn+F6        → Screenshot zone sélectionnée
+  SUPER + Fn+F6        → Screenshot fenêtre active
+  F7 / F8              → Luminosité écran ↓↑
+  F11 (lune)           → Mise en veille
+  F12                  → Mode avion
+
+ Médias
+  Vol+ / Vol- / Mute   → Volume (swayosd)
+  Lecture/Suiv/Préc    → Contrôle lecture
+
+ Session
+  SUPER + L            → Mise en veille
+  SUPER + SHIFT + M    → Quitter Hyprland"
+
+echo "$BINDS" | wofi --dmenu \
+    --prompt "" \
+    --width 560 \
+    --height 720 \
+    --no-actions \
+    --insensitive \
+    --style ~/.config/wofi/style.css

@@ -1,0 +1,17 @@
+[Unit]
+Description=Installation des mises à jour noyau/NVIDIA/Hyprland/Qt à l'extinction
+# Arrêté (donc ExecStop exécuté) avant le réseau et les systèmes de fichiers.
+After=network-online.target local-fs.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/maj-auto extinction
+TimeoutStopSec=30min
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

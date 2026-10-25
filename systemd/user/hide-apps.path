@@ -1,0 +1,9 @@
+[Unit]
+Description=Recacher les applis techniques après une mise à jour des paquets
+
+[Path]
+PathChanged=/usr/share/applications
+PathChanged=%h/.config/hidden-apps.list
+
+[Install]
+WantedBy=default.target

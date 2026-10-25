@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Save Hyprland's live monitor layout to ~/.config/hypr/monitors-<hostname>.lua.
+
+wdisplays applies layouts live but persists nothing; hyprland.lua loads this
+file at startup and on every reload. Per-monitor `vrr` is kept from the
+existing file (the live value only reflects the current fullscreen state).
+Writes only when the layout differs from what the file already holds.
+"""
+import datetime, json, os, re, subprocess
+
+host = open("/etc/hostname").read().strip()
+path = os.path.expanduser(f"~/.config/hypr/monitors-{host}.lua")
+
+old = open(path).read() if os.path.exists(path) else ""
+old_vrr = {m.group(1): m.group(2) for m in re.finditer(
+    r'output = "desc:([^"]*)"[^}]*?vrr = (\d)', old, re.S)}
+
+def hyprctl_json(*args):
+    return json.loads(subprocess.run(["hyprctl", *args, "-j"],
+                                     capture_output=True, text=True, check=True).stdout)
+
+monitors = hyprctl_json("monitors", "all")
+# The JSON "disabled" field is unreliable on hyprland-git (true for active
+# monitors): a monitor is enabled iff `hyprctl monitors` (active only) lists it.
+active = {m["name"] for m in hyprctl_json("monitors")}
+if not active:
+    raise SystemExit("hypr-monitors-save: no active monitor, not saving")
+blocks = []
+for m in sorted(monitors, key=lambda m: m["name"]):
+    props = [f'    output = "desc:{m["description"]}"']
+    if m["name"] not in active:
+        props.append("    disabled = true")
+    else:
+        props += [f'    mode = "{m["width"]}x{m["height"]}@{m["refreshRate"]:.3f}"',
+                  f'    position = "{m["x"]}x{m["y"]}"',
+                  f'    scale = {m["scale"]:.6f}']
+        if m["transform"]:
+            props.append(f'    transform = {m["transform"]}')
+        if m["description"] in old_vrr:
+            props.append(f'    vrr = {old_vrr[m["description"]]}')
+    blocks.append("hl.monitor({\n" + ",\n".join(props) + "\n})")
+body = "\n".join(blocks) + "\n"
+
+if old.split("\n", 2)[-1] == body:
+    raise SystemExit(0)
+now = datetime.datetime.now().strftime("%Y-%m-%d at %H:%M:%S")
+with open(path, "w") as f:
+    f.write(f"-- Saved from the live layout by hypr-monitors-save on {now}.\n\n{body}")
+print(f"saved {path}")

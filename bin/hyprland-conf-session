@@ -1,0 +1,114 @@
+#!/bin/bash
+# Wrapper: launches Hyprland with .conf, then triggers illogical-impulse exec-once manually
+set +e
+
+LOGDIR="${HOME}/.local/state/hypr-session"
+mkdir -p "$LOGDIR"
+
+echo "[wrapper] $(date -Iseconds) START pid=$$ user=$(id -un) XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$LOGDIR/wrapper.log"
+
+# Background autostart
+(
+  # Wait up to 30s for wayland socket
+  for i in $(seq 1 30); do
+    if [ -S "$XDG_RUNTIME_DIR/wayland-1" ]; then
+      export WAYLAND_DISPLAY=wayland-1
+      break
+    fi
+    if [ -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
+      export WAYLAND_DISPLAY=wayland-0
+      break
+    fi
+    sleep 1
+  done
+  sleep 2
+
+  # XWayland : Quickshell (et donc tout ce qu'on lance depuis son lanceur/dock)
+  # doit avoir DISPLAY, sinon les applis X11 comme Steam ne démarrent pas.
+  # Hyprland le publie dans l'environnement systemd une fois XWayland prêt.
+  for i in $(seq 1 20); do
+    DISPLAY="$(systemctl --user show-environment 2>/dev/null | sed -n 's/^DISPLAY=//p')"
+    [ -n "$DISPLAY" ] && [ -S "/tmp/.X11-unix/X${DISPLAY#:}" ] && break
+    DISPLAY=""
+    sleep 1
+  done
+  [ -n "$DISPLAY" ] && export DISPLAY
+
+  export HYPRLAND_INSTANCE_SIGNATURE="$(ls -t $XDG_RUNTIME_DIR/hypr/ 2>/dev/null | head -1)"
+  export QT_QPA_PLATFORM=wayland
+  export XDG_CURRENT_DESKTOP=Hyprland
+  export XDG_SESSION_TYPE=wayland
+  export GBM_BACKEND=nvidia-drm
+  export __GLX_VENDOR_LIBRARY_NAME=nvidia
+  export LIBVA_DRIVER_NAME=nvidia
+  export MOZ_ENABLE_WAYLAND=1
+  export ILLOGICAL_IMPULSE_VIRTUAL_ENV="$HOME/.local/state/quickshell/.venv"
+
+  {
+    echo "[autostart] $(date -Iseconds) start"
+    echo "  WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+    echo "  DISPLAY=$DISPLAY"
+    echo "  HYPRLAND_INSTANCE_SIGNATURE=$HYPRLAND_INSTANCE_SIGNATURE"
+    echo "  which qs: $(command -v qs)"
+    echo "  which hypridle: $(command -v hypridle)"
+    echo "  which gnome-keyring-daemon: $(command -v gnome-keyring-daemon)"
+  } >> "$LOGDIR/autostart.log"
+
+  dbus-update-activation-environment --systemd --all >>"$LOGDIR/autostart.log" 2>&1
+
+  if command -v gnome-keyring-daemon >/dev/null; then
+    eval "$(gnome-keyring-daemon --start --components=secrets 2>>"$LOGDIR/autostart.log")"
+    export SSH_AUTH_SOCK
+  fi
+
+  # qs, hypridle, pypr (scratchpads Super+Alt+T/M/N) et cliphist, supervisés :
+  # relancés s'ils plantent (voir ~/.local/bin/session-daemons).
+  if [ -x "$HOME/.local/bin/session-daemons" ]; then
+    "$HOME/.local/bin/session-daemons" &
+    echo "[autostart] launched session-daemons pid=$!" >> "$LOGDIR/autostart.log"
+  else
+    nohup qs -c ii >>"$LOGDIR/quickshell.log" 2>&1 &
+    nohup hypridle >>"$LOGDIR/hypridle.log" 2>&1 &
+    nohup pypr >>"$LOGDIR/pypr.log" 2>&1 &
+    nohup wl-paste --type text --watch cliphist store >>"$LOGDIR/cliphist.log" 2>&1 &
+    nohup wl-paste --type image --watch cliphist store >>"$LOGDIR/cliphist.log" 2>&1 &
+  fi
+
+  [ -x "$HOME/.local/bin/battery-alert" ] && "$HOME/.local/bin/battery-alert" &
+  [ -x "$HOME/.config/hypr/custom/scripts/__restore_video_wallpaper.sh" ] && \
+     "$HOME/.config/hypr/custom/scripts/__restore_video_wallpaper.sh" >>"$LOGDIR/wallpaper.log" 2>&1 &
+
+  # Cursor size chosen in Settings > Entrée is kept in gsettings
+  hyprctl setcursor macos-tahoe-cursor "$(gsettings get org.gnome.desktop.interface cursor-size 2>/dev/null || echo 24)" >>"$LOGDIR/autostart.log" 2>&1
+
+  # Self-heal: the first qs launch can race Hyprland's monitor init and skip the
+  # bar on a screen. Restart qs ONLY if a bar is still missing after 15 s: a blind
+  # restart kills the startup lock screen (ii lock) and leaves Hyprland's
+  # "lockscreen died" fallback (session-daemons now relocks after a restart).
+  (
+    missing=-1
+    for i in $(seq 1 15); do
+      sleep 1
+      missing=$(hyprctl monitors -j 2>/dev/null | jq -r --argjson l "$(hyprctl layers -j 2>/dev/null || echo '{}')" \
+        '[.[].name | select(([$l[.].levels[]?[]?.namespace] | index("quickshell:bar")) == null)] | length' 2>/dev/null)
+      [ "$missing" = 0 ] && exit 0
+    done
+    echo "[autostart] $(date -Iseconds) bar missing on $missing monitor(s): restarting qs" >> "$LOGDIR/autostart.log"
+    # session-daemons le relance, et reverrouille si l'écran de démarrage était verrouillé
+    pkill -x qs
+  ) &
+
+  echo "[autostart] $(date -Iseconds) done" >> "$LOGDIR/autostart.log"
+) &
+
+# Propagate to Hyprland children
+export XDG_CURRENT_DESKTOP=Hyprland
+export XDG_SESSION_TYPE=wayland
+export QT_QPA_PLATFORM=wayland
+export GBM_BACKEND=nvidia-drm
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+export LIBVA_DRIVER_NAME=nvidia
+export MOZ_ENABLE_WAYLAND=1
+export ILLOGICAL_IMPULSE_VIRTUAL_ENV="$HOME/.local/state/quickshell/.venv"
+
+exec /usr/bin/Hyprland --config "$HOME/.config/hypr/hyprland.lua"
