@@ -102,7 +102,7 @@ while Ctrl or Alt were held.
 
 ### 5. QD-OLED colour fringes
 
-**Problem.** The main monitor is a Samsung QD-OLED panel. Its subpixels are triangles: green on top, red
+**Problem.** The main monitor (an AOC at 360 Hz) has a QD-OLED panel. Its subpixels are triangles: green on top, red
 bottom left, blue bottom right. Light text on a dark background gets a green edge above and a magenta
 edge below. Fonts were already rendered in greyscale, so it comes from the panel geometry, not from
 font rendering.
