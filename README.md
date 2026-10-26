@@ -1,5 +1,7 @@
 # dotfiles: my Arch Linux + Hyprland desktop
 
+*[Version française](README.fr.md)*
+
 The configuration of my daily desktop: Arch Linux, Hyprland configured in **Lua**, a
 [Quickshell](https://quickshell.org) shell based on end-4's
 [illogical-impulse](https://github.com/end-4/dots-hyprland) (ii), three monitors and an NVIDIA RTX 5080,
